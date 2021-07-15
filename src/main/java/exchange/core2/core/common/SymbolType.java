@@ -21,8 +21,11 @@ import java.util.Arrays;
 
 @Getter
 public enum SymbolType {
+    // 现货交易对
     CURRENCY_EXCHANGE_PAIR(0),
+    // 期货合约
     FUTURES_CONTRACT(1),
+    // 期权
     OPTION(2);
 
     private byte code;
