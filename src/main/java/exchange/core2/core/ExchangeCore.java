@@ -15,11 +15,11 @@
  */
 package exchange.core2.core;
 
-import com.lmax.disruptor.EventHandler;
-import com.lmax.disruptor.EventTranslator;
+import com.lmax.disruptor.*;
 import com.lmax.disruptor.TimeoutException;
 import com.lmax.disruptor.dsl.Disruptor;
 import com.lmax.disruptor.dsl.EventHandlerGroup;
+import com.lmax.disruptor.dsl.EventProcessorFactory;
 import com.lmax.disruptor.dsl.ProducerType;
 import exchange.core2.core.common.CoreWaitStrategy;
 import exchange.core2.core.common.cmd.CommandResultCode;
@@ -28,6 +28,7 @@ import exchange.core2.core.common.cmd.OrderCommandType;
 import exchange.core2.core.common.config.ExchangeConfiguration;
 import exchange.core2.core.common.config.PerformanceConfiguration;
 import exchange.core2.core.common.config.SerializationConfiguration;
+import exchange.core2.core.handlers.MatchingEngineEventHandler;
 import exchange.core2.core.orderbook.IOrderBook;
 import exchange.core2.core.processors.*;
 import exchange.core2.core.processors.journaling.ISerializationProcessor;
@@ -144,7 +145,20 @@ public final class ExchangeCore {
 
         final EventHandler<OrderCommand>[] matchingEngineHandlers = matchingEngineFutures.values().stream()
                 .map(CompletableFuture::join)
-                .map(mer -> (EventHandler<OrderCommand>) (cmd, seq, eob) -> mer.processOrder(seq, cmd))
+                // .map(mer -> (EventHandler<OrderCommand>) (cmd, seq, eob) -> mer.processOrder(seq, cmd))
+                .map(matchingEngineRouter -> {
+                    // return new MatchingEngineEventHandler(matchingEngineRouter);
+                    return new EventHandler<OrderCommand>() {
+
+                        @Override
+                        public void onEvent(OrderCommand cmd, long seq, boolean endOfBatch) throws Exception {
+                            log.info("-> MatchingEngineRouter 开始处理 cmd: {}, seq: {}, router shardId: {}",
+                                    cmd, seq, matchingEngineRouter.getShardId());
+
+                            matchingEngineRouter.processOrder(seq, cmd);
+                        }
+                    };
+                })
                 .toArray(ExchangeCore::newEventHandlersArray);
 
         final Map<Integer, RiskEngine> riskEngines = riskEngineFutures.entrySet().stream()
@@ -158,7 +172,14 @@ public final class ExchangeCore {
 
         // 1. grouping processor (G)
         final EventHandlerGroup<OrderCommand> afterGrouping =
-                disruptor.handleEventsWith((rb, bs) -> new GroupingProcessor(rb, rb.newBarrier(bs), perfCfg, coreWaitStrategy, sharedPool));
+                // disruptor.handleEventsWith((rb, bs) -> new GroupingProcessor(rb, rb.newBarrier(bs), perfCfg, coreWaitStrategy, sharedPool));
+                disruptor.handleEventsWith(new EventProcessorFactory<OrderCommand>() {
+                    @Override
+                    public EventProcessor createEventProcessor(RingBuffer<OrderCommand> rb, Sequence[] sequences) {
+                        log.info("-> 创建 GroupingProcessor， sequences: {}", Arrays.toString(sequences));
+                        return new GroupingProcessor(rb, rb.newBarrier(sequences), perfCfg, coreWaitStrategy, sharedPool);
+                    }
+                });
 
         // 2. [journaling (J)] in parallel with risk hold (R1) + matching engine (ME)
 
@@ -166,16 +187,29 @@ public final class ExchangeCore {
         final EventHandler<OrderCommand> jh = enableJournaling ? serializationProcessor::writeToJournal : null;
 
         if (enableJournaling) {
+            log.info("enableJournaling 开启，journalHandling: {}", jh);
             afterGrouping.handleEventsWith(jh);
         }
 
-        riskEngines.forEach((idx, riskEngine) -> afterGrouping.handleEventsWith(
-                (rb, bs) -> {
-                    final TwoStepMasterProcessor r1 = new TwoStepMasterProcessor(rb, rb.newBarrier(bs), riskEngine::preProcessCommand, exceptionHandler, coreWaitStrategy, "R1_" + idx);
-                    procR1.add(r1);
-                    return r1;
-                }));
+//        riskEngines.forEach((idx, riskEngine) -> afterGrouping.handleEventsWith(
+//                (rb, bs) -> {
+//                    final TwoStepMasterProcessor r1 = new TwoStepMasterProcessor(rb, rb.newBarrier(bs), riskEngine::preProcessCommand, exceptionHandler, coreWaitStrategy, "R1_" + idx);
+//                    procR1.add(r1);
+//                    return r1;
+//                }));
 
+        riskEngines.forEach((idx, riskEngine) -> afterGrouping.handleEventsWith(new EventProcessorFactory<OrderCommand>() {
+            @Override
+            public EventProcessor createEventProcessor(RingBuffer<OrderCommand> rb, Sequence[] sequences) {
+                final TwoStepMasterProcessor r1 = new TwoStepMasterProcessor(rb, rb.newBarrier(sequences),
+                        riskEngine::preProcessCommand, exceptionHandler, coreWaitStrategy, "R1_" + idx);
+                log.info("-> 创建 TwoStepMasterProcessor: {}", r1);
+                procR1.add(r1);
+                return r1;
+            }
+        }));
+
+        // riskEngine 之后执行 matchingEngineHandlers (分发命令给 OrderBook)
         disruptor.after(procR1.toArray(new TwoStepMasterProcessor[0])).handleEventsWith(matchingEngineHandlers);
 
         // 3. risk release (R2) after matching engine (ME)
@@ -184,6 +218,7 @@ public final class ExchangeCore {
         riskEngines.forEach((idx, riskEngine) -> afterMatchingEngine.handleEventsWith(
                 (rb, bs) -> {
                     final TwoStepSlaveProcessor r2 = new TwoStepSlaveProcessor(rb, rb.newBarrier(bs), riskEngine::handlerRiskRelease, exceptionHandler, "R2_" + idx);
+                    log.info("-> 创建 TwoStepSlaveProcessor: {}", r2);
                     procR2.add(r2);
                     return r2;
                 }));
